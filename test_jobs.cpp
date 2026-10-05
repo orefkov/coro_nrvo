@@ -1,6 +1,23 @@
 #include "jobs.h"
 #include <gtest/gtest.h>
 #include <vector>
+
+job<std::vector<int>> sss() {
+    throw 1;
+    co_return std::vector<int>{1};
+}
+
+TEST(Job, Throw) {
+    try {
+        auto e = sss().exec();
+        std::move(e).result();
+    } catch(...) {
+        std::cout << "Catch\n";
+    }
+}
+
+size_t dtors_count = 0;
+
 /*!
  * @brief Простой объект
  */
@@ -10,6 +27,7 @@ struct simple_copy_moveable_object {
         std::cout << "Create simple_copy_moveable_object at " << *this << "\n";
     }
     ~simple_copy_moveable_object() {
+        dtors_count++;
         std::cout << "Destruct simple_copy_moveable_object at " << *this << "\n";
     }
 
@@ -43,17 +61,25 @@ job<simple_copy_moveable_object> simple_return_object() {
 
 TEST(Job, SimpleReturn) {
     // Здесь будет два перемещения и два промежуточных объекта.
-    simple_copy_moveable_object obj = simple_return_object().exec().result();
-    std::cout << "Get return object " << obj << "\n";
-    EXPECT_TRUE(obj.a_ == 1 && obj.b_ == 2 && obj.c_ == 3);
+    dtors_count = 0;
+    {
+        simple_copy_moveable_object obj = simple_return_object().exec().result();
+        std::cout << "Get return object " << obj << "\n";
+        EXPECT_TRUE(obj.a_ == 1 && obj.b_ == 2 && obj.c_ == 3);
+    }
+    EXPECT_EQ(dtors_count, 3);
 }
 
 TEST(Job, SimpleReturnTo) {
     // А здесь мы можем сэкономить одно перемещение и один промежуточный объект,
     // послав в корутину ссылку, куда сразу сохранять возвращаемый объект.
-    uninit<simple_copy_moveable_object> obj = simple_return_object().exec_to(obj).result();
-    std::cout << "Get return object " << *obj << "\n";
-    EXPECT_TRUE(obj->a_ == 1 && obj->b_ == 2 && obj->c_ == 3);
+    dtors_count = 0;
+    {
+        uninit<simple_copy_moveable_object> obj = simple_return_object().exec_to(obj).result();
+        std::cout << "Get return object " << *obj << "\n";
+        EXPECT_TRUE(obj->a_ == 1 && obj->b_ == 2 && obj->c_ == 3);
+    }
+    EXPECT_EQ(dtors_count, 2);
 }
 
 // А эта корутина сразу создаёт возвращаемый объект там, где нужно, "по месту".
@@ -68,19 +94,27 @@ job<simple_copy_moveable_object> simple_emplace_object() {
 }
 
 TEST(Job, SimpleReturnEmplaced) {
-    // Обычный вызов такой корутины тоже экономит одно перемещение.
-    simple_copy_moveable_object obj = simple_emplace_object().exec().result();
-    std::cout << "Get return object " << obj << "\n";
-    EXPECT_TRUE(obj.a_ == 11 && obj.b_ == 2 && obj.c_ == 3);
+    dtors_count = 0;
+    {
+        // Обычный вызов такой корутины тоже экономит одно перемещение.
+        simple_copy_moveable_object obj = simple_emplace_object().exec().result();
+        std::cout << "Get return object " << obj << "\n";
+        EXPECT_TRUE(obj.a_ == 11 && obj.b_ == 2 && obj.c_ == 3);
+    }
+    EXPECT_EQ(dtors_count, 2);
 }
 
 TEST(Job, SimpleReturnEmplacedUninit) {
-    // А это комбинация обоих методов - мы передаём корутине ссылку, где размещать возвращаемый объект,
-    // а корутина размещаем там результат. Получаем идеальный возврат - нужное значение
-    // создаётся сразу "по месту", никаких перемещений или копий
-    uninit<simple_copy_moveable_object> obj = simple_emplace_object().exec_to(obj).result();
-    std::cout << "Get return object " << *obj << "\n";
-    EXPECT_TRUE(obj->a_ == 11 && obj->b_ == 2 && obj->c_ == 3);
+    dtors_count = 0;
+    {
+        // А это комбинация обоих методов - мы передаём корутине ссылку, где размещать возвращаемый объект,
+        // а корутина размещаем там результат. Получаем идеальный возврат - нужное значение
+        // создаётся сразу "по месту", никаких перемещений или копий
+        uninit<simple_copy_moveable_object> obj = simple_emplace_object().exec_to(obj).result();
+        std::cout << "Get return object " << *obj << "\n";
+        EXPECT_TRUE(obj->a_ == 11 && obj->b_ == 2 && obj->c_ == 3);
+    }
+    EXPECT_EQ(dtors_count, 1);
 }
 
 job<int> await_another_emplace_coro(int k) {
@@ -109,11 +143,15 @@ job<simple_copy_moveable_object> perfect_return() {
 }
 
 TEST(Job, PerfectInnerReturn) {
-    // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
-    // сразу в нужное место, без копирований и перемещений.
-    uninit<simple_copy_moveable_object> obj = perfect_return().exec_to(obj).result();
-    std::cout << "Get return object " << *obj << "\n";
-    EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
+    dtors_count = 0;
+    {
+        // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
+        // сразу в нужное место, без копирований и перемещений.
+        uninit<simple_copy_moveable_object> obj = perfect_return().exec_to(obj).result();
+        std::cout << "Get return object " << *obj << "\n";
+        EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
+    }
+    EXPECT_EQ(dtors_count, 1);
 }
 
 job<simple_copy_moveable_object> inner_call_with_exception() {
@@ -140,7 +178,7 @@ job<simple_copy_moveable_object> perfect_return_exception() {
 }
 
 // Проверка деструкторов при передаче ссылки на возвращаемое значение во вложенную корутину при исключении после неё.
-job<simple_copy_moveable_object> perfect_return_post_exception() {
+job<simple_copy_moveable_object> perfect_return_exception_after() {
     // Передаём ссылку на возвращаемое значение другой корутине
     auto& my_result = *co_await_to(co_for_emplace)(simple_emplace_object());
     std::cout << "Get return from inner coroutine " << my_result << "\n";
@@ -151,30 +189,67 @@ job<simple_copy_moveable_object> perfect_return_post_exception() {
     co_done;
 }
 
-TEST(Job, PerfectInnerReturnException) {
-    try {
-        // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
-        // сразу в нужное место, без копирований и перемещений.
-        uninit<simple_copy_moveable_object> obj = perfect_return_exception().exec_to(obj).result();
-        // Сюда не попадаем из-за исключения
-        std::cout << "Get return object " << *obj << "\n";
-        EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
-    } catch (int) {
-        std::cout << "Catch int\n";
-    }
+// Проверка деструкторов при передаче ссылки на возвращаемое значение во вложенную корутину при исключении до создания результата.
+job<simple_copy_moveable_object> perfect_return_exception_before() {
+    throw 1;
+    // Сюда не попадём
+    // Передаём ссылку на возвращаемое значение другой корутине
+    auto& my_result = *co_await_to(co_for_emplace)(simple_emplace_object());
+    std::cout << "Get return from inner coroutine " << my_result << "\n";
+    // Модифицируем то, что вернула другая корутина
+    my_result.a_ += 10;
+    co_done;
 }
 
-TEST(Job, PerfectInnerReturnPostException) {
-    try {
-        // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
-        // сразу в нужное место, без копирований и перемещений.
-        uninit<simple_copy_moveable_object> obj = perfect_return_post_exception().exec_to(obj).result();
-        // Сюда не попадаем из-за исключения
-        std::cout << "Get return object " << *obj << "\n";
-        EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
-    } catch (int) {
-        std::cout << "Catch int\n";
+TEST(Job, PerfectInnerReturnException) {
+    dtors_count = 0;
+    {
+        try {
+            // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
+            // сразу в нужное место, без копирований и перемещений.
+            uninit<simple_copy_moveable_object> obj = perfect_return_exception().exec_to(obj).result();
+            // Сюда не попадаем из-за исключения
+            std::cout << "Get return object " << *obj << "\n";
+            EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
+        } catch (int) {
+            std::cout << "Catch int\n";
+        }
     }
+    EXPECT_EQ(dtors_count, 1);
+}
+
+TEST(Job, PerfectInnerReturnExceptionAfter) {
+    dtors_count = 0;
+    {
+        try {
+            // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
+            // сразу в нужное место, без копирований и перемещений.
+            uninit<simple_copy_moveable_object> obj = perfect_return_exception_after().exec_to(obj).result();
+            // Сюда не попадаем из-за исключения
+            std::cout << "Get return object " << *obj << "\n";
+            EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
+        } catch (int) {
+            std::cout << "Catch int\n";
+        }
+    }
+    EXPECT_EQ(dtors_count, 1);
+}
+
+TEST(Job, PerfectInnerReturnExceptionBefore) {
+    dtors_count = 0;
+    {
+        try {
+            // Здесь мы получаем результат из вложенного вызова корутины, но по прежнему
+            // сразу в нужное место, без копирований и перемещений.
+            uninit<simple_copy_moveable_object> obj = perfect_return_exception_before().exec_to(obj).result();
+            // Сюда не попадаем из-за исключения
+            std::cout << "Get return object " << *obj << "\n";
+            EXPECT_TRUE(obj->a_ == 21 && obj->b_ == 2 && obj->c_ == 3);
+        } catch (int) {
+            std::cout << "Catch int\n";
+        }
+    }
+    EXPECT_EQ(dtors_count, 0);
 }
 
 // Объект, который нельзя ни копировать, ни перемещать.

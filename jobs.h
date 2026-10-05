@@ -5,9 +5,11 @@
 #include <memory>
 #include <iostream>
 #include <atomic>
+#include <optional>
 
 #if defined(_MSC_VER)
 #define __PRETTY_FUNCTION__ __FUNCSIG__
+#define no_unique_address msvc::no_unique_address
 #endif
 
 /*!
@@ -26,7 +28,7 @@
  *      some_func(var->size());
  *      use(*var);
  */
-template<typename T>
+template<typename T, bool AutoDestruct = !std::is_trivially_destructible_v<T>>
 struct uninit {
     uninit() = default;
     uninit(uninit&& o) noexcept {
@@ -36,8 +38,22 @@ struct uninit {
         // Только проверим, что вызываемся сами для себя.
         assert(&o == this);
     }
+    uninit(uninit<T, !AutoDestruct>&& o) noexcept {
+        // Так как этот тип предполагается использовать только для передачи неинициализированных
+        // переменных в левую часть присваивания/инициализации самому себе же, сделаем конструктор
+        // перемещения, в котором ничего не делаем.
+        // Только проверим, что вызываемся сами для себя.
+        assert((uintptr_t)&o == (uintptr_t)this);
+    }
     ~uninit() {
-        reinterpret_cast<T*>(value_)->~T();
+        if constexpr (AutoDestruct) {
+            dtor();
+        }
+    }
+    void dtor() {
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            reinterpret_cast<T*>(value_)->~T();
+        }
     }
     // Не копируемый, не присваиваемый.
     uninit(const uninit& o) = delete;
@@ -68,32 +84,72 @@ private:
 };
 
 // Выясним, в каком виде промежуточно хранить возвращаемое корутиной значение.
+template<typename T, bool AutoDestruct = false>
+using job_store_type_t = uninit<std::conditional_t<std::is_reference_v<T>, std::remove_cvref_t<T>*, T>, AutoDestruct>;
+
+/*!
+ * @brief Базовый класс хранилища результата корутины
+ */
+struct coro_result_store {
+    void* result_{};                // Куда сохранить результат.
+    std::exception_ptr exception_;  // Произошедшее исключение.
+    bool done_{};                   // Корутина была завершена.
+    bool has_result_{};             // В корутине был установлен результат.
+};
+
+/*!
+ * @brief Типизированная обёртка хранилища результата корутины
+ * @tparam T - тип результата
+ */
 template<typename T>
-using job_ret_type_t = uninit<std::conditional_t<std::is_reference_v<T>, std::remove_cvref_t<T>*, T>>;
+struct typed_coro_result_store : coro_result_store {
+    job_store_type_t<T>& result() {
+        return *reinterpret_cast<job_store_type_t<T>*>(result_);
+    }
+};
+
+/*!
+ * @brief Дефолтное хранилище результата, в котором результат лежит тут же.
+ * @tparam T - тип результата
+ */
+template<typename T>
+struct typed_coro_result : typed_coro_result_store<T> {
+    typed_coro_result() {
+        this->result_ = &result_store_;
+    }
+    ~typed_coro_result() {
+        if (this->has_result_) {
+            result_store_.dtor();
+        }
+    }
+    [[no_unique_address]]
+    job_store_type_t<T> result_store_;
+};
+
 
 // Тип для трюка по конструированию возвращаемого корутиной объекта inplace.
 struct result_ready_t{};
 constexpr result_ready_t result_ready;
 
 // База для ожидателя корутины
-struct job_waiter {
+struct simple_job_waiter {
     std::coroutine_handle<> run_after_;
-    std::exception_ptr exception_{};
     std::atomic_size_t* done_count_{};
-    void check_exception() const {
-        if (exception_) {
-            std::rethrow_exception(exception_);
-        }
-    }
 };
 
 // База для промиса корутины
-struct job_promise_type_base {
+struct promise_type_base {
     // Кто нас ждёт
-    job_waiter* waiter_{};
+    simple_job_waiter* waiter_{};
+    coro_result_store* result_place_{};     // Куда помещать результат
+
+    void check_result_store() {
+        assert(result_place_ != nullptr && "Не установлено хранилище результата!");
+    }
 
     void unhandled_exception() noexcept {
-        waiter_->exception_ = std::current_exception();
+        check_result_store();
+        result_place_->exception_ = std::current_exception();
     }
     // Эта структура работает при завершении корутины
     struct final_awaitable : std::suspend_always {
@@ -101,14 +157,21 @@ struct job_promise_type_base {
         // добавленный при запуске, решить, какую корутину выполнять дальше
         template<typename Promise>
         std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> coroutine) noexcept {
-            job_waiter* waiter = coroutine.promise().waiter_;
+            auto& promise = coroutine.promise();
+            promise.check_result_store();
+            promise.result_place_->done_ = true;
+
+            simple_job_waiter* waiter = promise.waiter_;
             coroutine.destroy();
-            if (waiter->done_count_) {
-                if (waiter->done_count_->fetch_sub(1, std::memory_order_relaxed) != 1) {
-                    return std::noop_coroutine();
+            if (waiter) {
+                if (waiter->done_count_) {
+                    if (waiter->done_count_->fetch_sub(1, std::memory_order_relaxed) != 1) {
+                        return std::noop_coroutine();
+                    }
                 }
+                return waiter->run_after_; // Возобновим уснувшую на нас корутину
             }
-            return waiter->run_after_; // Возобновим уснувшую на нас корутину
+            return std::noop_coroutine();
         }
     };
     std::suspend_always initial_suspend() noexcept { return {}; }
@@ -117,85 +180,92 @@ struct job_promise_type_base {
 
 // Промис корутины с типом возвращаемого значения
 template<typename T>
-struct typed_promise : job_promise_type_base {
+struct typed_promise : promise_type_base {
     // Куда сохранять результат
-    job_ret_type_t<T>* result_{};
-    bool result_initiated_{};
+    typed_coro_result_store<T>& result_store() {
+        check_result_store();
+        return *static_cast<typed_coro_result_store<T>*>(result_place_);
+    };
 
     // Это для возвращения значения в co_return.
     template<typename V> requires std::is_convertible_v<V&&, T>
     void return_value(V&& v) noexcept(std::is_nothrow_constructible_v<T, V&&>) {
-        assert(!result_initiated_);
+        auto& store = result_store();
+        assert(!store.has_result_ && "Результат уже установлен!");
+
         if constexpr (std::is_reference_v<T>) {
-            result_->emplace(std::addressof(const_cast<std::remove_cvref_t<T>&>(v)));
+            store.result().emplace(std::addressof(const_cast<std::remove_cvref_t<T>&>(v)));
         } else {
-            result_->emplace(std::forward<V>(v));
+            store.result().emplace(std::forward<V>(v));
         }
-        result_initiated_ = true;
+        store.has_result_ = true;
+
     }
     // Это для трюка, когда мы уже инициализировали возвращаемое значение не через return_value,
     // а в co_return что-то указать надо.
     void return_value(const result_ready_t&) {
-        assert(result_initiated_);
+        assert(result_store().has_result_ && "Вызов co_done без установленного результата!");
     }
 
     void unhandled_exception() noexcept {
-        job_promise_type_base::unhandled_exception();
-        if constexpr (!std::is_reference_v<T> && !std::is_trivially_destructible_v<T>) {
-            if (result_initiated_) {
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            if (auto& store = result_store(); store.has_result_) {
                 // С точки зрения компилятора uninit<T> слева от присваивания всё ещё не инициализирован,
                 // но мы уже разместили в нём значение, вызовем деструктор принудительно
-                result_->~job_ret_type_t<T>();
+                store.result().dtor();
+                store.has_result_ = false;
             }
         }
+        promise_type_base::unhandled_exception();
     }
 };
 
 // Промис void корутины
 template<>
-struct typed_promise<void> : job_promise_type_base {
-    void return_void() noexcept {}
-};
+struct typed_promise<void> : promise_type_base {
+    void return_void() noexcept {
+        check_result_store();
+        result_place_->has_result_ = true;
 
+    }
+};
 // Этот объект будем возвращать из co_emplace;
 // Он знает, где лежит неинициализированное возвращаемое корутиной значение, и позволяет инициализировать его
 // раньше, чем в co_return, и с нужным конструктором.
 template<typename T>
 class co_emplace_t {
-    uninit<T>& res_;    // Здесь храним ссылку на возвращаемое корутиной значение
-    bool& initiated_; // Сюда пишем флаг инициализированности.
+    typed_coro_result_store<T>* res_;
 public:
-    co_emplace_t(uninit<T>& res, bool& initiated) : res_(res), initiated_(initiated){}
+    co_emplace_t(typed_coro_result_store<T>* res) : res_(res){}
     co_emplace_t(const co_emplace_t&) = delete;
     co_emplace_t& operator=(const co_emplace_t&) = delete;
 
     template<typename...Args> requires std::is_constructible_v<T, Args...>
     T& operator()(Args&&...args) && noexcept(std::is_nothrow_constructible_v<T, Args...>) {
-        assert(!initiated_);
-        T& ret = res_.emplace(std::forward<Args>(args)...);
-        initiated_ = true;
+        assert(!res_->has_result_);
+        T& ret = res_->result().emplace(std::forward<Args>(args)...);
+        res_->has_result_ = true;
         return ret;
     }
 };
 
 // Это awaiter, который возвращает co_emplace_t
-template<typename T>
+template<typename T> requires (!std::is_void_v<T>)
 struct await_co_emplace {
     constexpr bool await_ready() const noexcept {return false;}
 
-    uninit<T>* ret_;
-    bool* initiated_;
+    typed_coro_result_store<T>* res_{};
 
     template<typename P>
     bool await_suspend(std::coroutine_handle<P> s) {
-        P& promise = s.promise();
-        assert(!promise.result_initiated_);
-        ret_ = promise.result_;
-        initiated_ = &promise.result_initiated_;
+        promise_type_base& promise = s.promise();
+        promise.check_result_store();
+        res_ = static_cast<typed_coro_result_store<T>*>(promise.result_place_);
+        assert(!res_->has_result_ && "Результат уже установлен!");
         return false;
     }
     co_emplace_t<T> await_resume() const {
-        return {*ret_, *initiated_};
+        return { res_ };
     }
 };
 
@@ -204,44 +274,40 @@ struct await_co_emplace {
 // установит флаг инициализированности.
 template<typename T>
 class co_for_emplace_t {
-    uninit<T>& res_;  // Здесь храним ссылку на возвращаемое корутиной значение
-    bool& initiated_; // Сюда пишем флаг инициализированности.
+    typed_coro_result_store<T>* res_{};
 public:
-    co_for_emplace_t(uninit<T>& res, bool& initiated) : res_(res), initiated_(initiated){}
+    co_for_emplace_t(typed_coro_result_store<T>* res) : res_(res){}
     co_for_emplace_t(const co_for_emplace_t&) = delete;
     co_for_emplace_t& operator=(const co_for_emplace_t&) = delete;
 
-    uninit<T>& res()&& {
-        assert(!initiated_);
-        return res_;
+    job_store_type_t<T>& res() && {
+        assert(!res_->has_result_);
+        return res_->result();
     }
     ~co_for_emplace_t() {
         if (!std::uncaught_exceptions()) {
-            initiated_ = true;
+            res_->has_result_ = true;
         }
     }
 };
 
 // Это awaiter, который возвращает co_for_emplace_t
-template<typename T>
+template<typename T> requires (!std::is_void_v<T>)
 struct await_co_for_emplace {
     constexpr bool await_ready() const noexcept {return false;}
 
-    uninit<T>* ret_;
-    bool* initiated_;
+    typed_coro_result_store<T>* res_{};
 
     template<typename P>
     bool await_suspend(std::coroutine_handle<P> s) {
-        P& promise = s.promise();
-
-        assert(!promise.result_initiated_);
-
-        ret_ = promise.result_;
-        initiated_ = &promise.result_initiated_;
+        promise_type_base& promise = s.promise();
+        promise.check_result_store();
+        res_ = static_cast<typed_coro_result_store<T>*>(promise.result_place_);
+        assert(!res_->has_result_ && "Результат уже установлен!");
         return false;
     }
     co_for_emplace_t<T> await_resume() const {
-        return {*ret_, *initiated_};
+        return { res_ };
     }
 };
 
@@ -254,32 +320,36 @@ struct co_result_ref_t {
 };
 
 // Это awaiter, который возвращает co_result_ref_t
-template<typename T>
+template<typename T> requires (!std::is_void_v<T>)
 struct await_co_result_ref {
     constexpr bool await_ready() const noexcept {return false;}
 
-    uninit<T>* ret_;
+    job_store_type_t<T>* ret_;
 
     template<typename P>
     bool await_suspend(std::coroutine_handle<P> s) {
-        P& promise = s.promise();
-        assert(promise.result_initiated_);
-        ret_ = promise.result_;
+        promise_type_base& promise = s.promise();
+        promise.check_result_store();
+        auto res = static_cast<typed_coro_result_store<T>*>(promise.result_place_);
+        assert(res->has_result_ && "Результат ещё не установлен!");
+        ret_ = &res->result();
         return false;
     }
     co_result_ref_t<T> await_resume() const {
-        return {**ret_};
+        return { **ret_ };
     }
 };
 
-template<typename T>
+template<typename T> requires (!std::is_void_v<T>)
 struct co_await_to_t {
-    co_await_to_t(uninit<T>& res) : res_(res){}
+    co_await_to_t(uninit<T, true>& res) : res_(reinterpret_cast<job_store_type_t<T>&>(res)){}
+    co_await_to_t(uninit<T, false>& res) : res_(reinterpret_cast<job_store_type_t<T>&>(res)){}
     decltype(auto) operator()(auto&& j) {
         return std::move(j).to(res_);
     }
-    uninit<T>& res_;
+    job_store_type_t<T>& res_;
 };
+
 
 // Тип для трюка с инициализацией возвращаемого корутиной значения ещё до co_return.
 constexpr struct co_emplace_trick{} co_emplace_v;
@@ -295,25 +365,35 @@ constexpr struct co_result_ref_trick{} co_result_ref_v;
 #define co_await_to(p) co_await co_await_to_t{p}
 #define co_done co_return result_ready
 
-// База для awaiter'ов, представляющих корутину
+
+
+/*!
+ * @brief База для самых простых awaiter'ов, которые возвращает самая обычная корутина, просто запускаемая в потоке
+ * и возобновляющая после завершения вызывающую корутину.
+ * @tparam J - тип корутины
+ */
 template<typename J>
-struct awaitable_base : job_waiter {
+struct simple_awaitable_base : simple_job_waiter {
     using promise_type = typename J::promise_type;
 
     std::coroutine_handle<promise_type> my_coro_;
 
-    awaitable_base(J& w) noexcept : my_coro_(w.my_coro_) {
+    // Этот ожидатель работает для нерасшариваемых корутин, которых не могут ждать несколько ожидателей,
+    // и не могут быть запускаемы из нескольких мест. Поэтому применимы только для prvalue джобов,
+    // крадя их корутину.
+    simple_awaitable_base(J&& w) noexcept : my_coro_(w.my_coro_) {
         w.my_coro_ = {};
     }
 
     constexpr bool await_ready() const noexcept { return false; }
 
     template<typename Promise>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspendedCoro) noexcept {
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspended) noexcept {
         // Запомним кого запускать после себя
-        run_after_ = suspendedCoro;
+        run_after_ = suspended;
         // Своей корутине установим себя как текущего ожидателя
-        my_coro_.promise().waiter_ = this;
+        auto& promise = my_coro_.promise();
+        promise.waiter_ = this;
         // Запустим корутину
         return my_coro_;
     }
@@ -322,74 +402,70 @@ struct awaitable_base : job_waiter {
 // Простой типовой ожидатель нашей корутины. В себе хранит неинициализированное возвращаемое корутиной
 // значение, которое они инициализирует через co_return, и возвращает его в await_resume.
 template<typename J, typename K>
-struct awaitable : awaitable_base<J> {
-    using awaitable_base<J>::awaitable_base;
-    job_ret_type_t<K> result_;  // Здесь лежит возвращаемое корутиной значение
+struct simple_awaitable : simple_awaitable_base<J> {
+    using simple_awaitable_base<J>::simple_awaitable_base;
+    typed_coro_result<K> result_store_;  // Здесь лежит возвращаемое корутиной значение
 
     template<typename Promise>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspendedCoro) noexcept {
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspended) noexcept {
         // Укажем корутине, куда сохранять возвращаемое значение
-        this->my_coro_.promise().result_ = &result_;
-        return awaitable_base<J>::await_suspend(suspendedCoro);
+        this->my_coro_.promise().result_place_ = &result_store_;
+        return simple_awaitable_base<J>::await_suspend(suspended);
     }
 
     decltype(auto) await_resume() {
-        this->check_exception();
-        if constexpr (std::is_reference_v<K>) {
-            return static_cast<K>(**result_);
-        } else {
-            return std::move(*result_);
+        if (result_store_.exception_) {
+            std::rethrow_exception(result_store_.exception_);
         }
-    }
-};
 
-// Специализация для void
-template<typename J>
-struct awaitable<J, void> : awaitable_base<J> {
-    using awaitable_base<J>::awaitable_base;
-
-    void await_resume() {
-        this->check_exception();
+        assert(result_store_.has_result_ && result_store_.done_ && "Результат не установлен или корутина не завершена!");
+        if constexpr (std::is_void_v<K>) {
+            return;
+        } else if constexpr (std::is_reference_v<K>) {
+            return static_cast<K>(**result_store_.result_store_);
+        } else {
+            return std::move(*result_store_.result_store_);
+        }
     }
 };
 
 // Ожидатель корутины, инициализируемый внешним неинициализированным значением.
 // Хранит ссылку на неинициализированное значение.
+// В отличии от simple_awaitable мы не вызываем деструктор возвращаемого значения, так как
+// не владеем им, а только передаём ссылку.
 template<typename J, typename K>
-struct awaitable_transfer : awaitable_base<J> {
-    uninit<K>& result_;
-    awaitable_transfer(J& w, uninit<K>& r) noexcept : awaitable_base<J>(w), result_(r){}
+struct awaitable_transfer : simple_awaitable_base<J> {
+    typed_coro_result_store<K> result_store_;  // Здесь лежит возвращаемое корутиной значение
 
-    template<typename Promise>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspendedCoro) noexcept {
-        // Укажем корутине, куда сохранять возвращаемое значение
-        this->my_coro_.promise().result_ = &result_;
-        return awaitable_base<J>::await_suspend(suspendedCoro);
+    awaitable_transfer(J&& w, job_store_type_t<K>& r) noexcept : simple_awaitable_base<J>(std::move(w)) {
+        result_store_.result_ = &r;
     }
 
-    uninit<K>&& await_resume() {
-        this->check_exception();
-        return std::move(result_);
+    template<typename Promise>
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> suspended) noexcept {
+        // Укажем корутине, куда сохранять возвращаемое значение
+        this->my_coro_.promise().result_place_ = &result_store_;
+        return simple_awaitable_base<J>::await_suspend(suspended);
+    }
+
+    job_store_type_t<K>&& await_resume() {
+        if (result_store_.exception_) {
+            std::rethrow_exception(result_store_.exception_);
+        }
+
+        assert(result_store_.has_result_ && result_store_.done_ && "Результат не установлен или корутина не завершена!");
+        return std::move(result_store_.result());
     }
 };
 
 // База для запускателя корутины без co_await
 template<typename J>
-struct exec_base : job_waiter {
+struct exec_base {
     using promise_type = typename J::promise_type;
     std::coroutine_handle<promise_type> my_coro_;
 
-    exec_base(J& w) noexcept : my_coro_(w.my_coro_) {
-        w.my_coro_ = {};
-        run_after_ = std::noop_coroutine();
-        my_coro_.promise().waiter_ = this;
-    }
-    bool done() const {
-        return my_coro_.done();
-    }
-    void resume() const {
-        my_coro_.resume();
-        this->check_exception();
+    exec_base(J& j) noexcept : my_coro_(j.my_coro_) {
+        j.my_coro_ = {};
     }
 };
 
@@ -397,40 +473,65 @@ struct exec_base : job_waiter {
 // значение, которое она инициализирует через co_return, и возвращает его в result.
 template<typename J, typename K>
 struct executable : exec_base<J> {
-    job_ret_type_t<K> result_;
+    typed_coro_result<K> result_store_;
 
-    executable(J& w) : exec_base<J>(w) {
+    executable(J& j) : exec_base<J>(j) {
         // Укажем корутине, куда сохранять значение
-        this->my_coro_.promise().result_ = &result_;
-        this->resume();
+        this->my_coro_.promise().result_place_ = &result_store_;
+        resume();
+    }
+    void resume() const {
+        assert(!done());
+        this->my_coro_.resume();
+        if (result_store_.exception_) {
+            std::rethrow_exception(result_store_.exception_);
+        }
+    }
+    bool done() const {
+        return result_store_.done_;
     }
     decltype(auto) result() && {
+        if (!(result_store_.has_result_ && result_store_.done_)) {
+            throw std::bad_optional_access{};
+        }
+        if constexpr (std::is_void_v<K>) {
+            return;
+        }
         if constexpr (std::is_reference_v<K>) {
-            return static_cast<K>(**result_);
+            return static_cast<K>(**result_store_.result());
         } else {
-            return std::move(*result_);
+            return std::move(*result_store_.result());
         }
     }
 };
-// Специализация для void
-template<typename J>
-struct executable<J, void> : exec_base<J> {
-    executable(J& w) : exec_base<J>(w) {
-        this->resume();
-    }
-};
+
 // Запускатель корутины, инициализируемый внешним неинициализированным значением.
 // Хранит ссылку на неинициализированное значение.
 template<typename J, typename K>
 struct executable_transfer : exec_base<J> {
-    uninit<K>& result_;
-    executable_transfer(J& w, uninit<K>& r) : exec_base<J>(w), result_(r) {
+    typed_coro_result_store<K> result_store_;
+
+    executable_transfer(J& j, job_store_type_t<K>& r) : exec_base<J>(j) {
+        result_store_.result_ = &r;
         // Укажем корутине, куда сохранять значение
-        this->my_coro_.promise().result_ = &result_;
-        this->resume();
+        this->my_coro_.promise().result_place_ = &result_store_;
+        resume();
     }
-    uninit<K>&& result() && {
-        return std::move(result_);
+    void resume() const {
+        assert(!done());
+        this->my_coro_.resume();
+        if (result_store_.exception_) {
+            std::rethrow_exception(result_store_.exception_);
+        }
+    }
+    bool done() const {
+        return result_store_.done_;
+    }
+    job_store_type_t<K>&& result() {
+        if (!(result_store_.has_result_ && result_store_.done_)) {
+            throw std::bad_optional_access{};
+        }
+        return std::move(result_store_.result());
     }
 };
 
@@ -458,13 +559,10 @@ struct job {
         decltype(auto) await_transform(Awaiter&& a) {
             using awaiter = std::remove_cvref_t<Awaiter>;
             if constexpr (std::is_same_v<awaiter, co_emplace_trick>) {
-                static_assert(!std::is_reference_v<T>);
                 return await_co_emplace<T>{};
             } else if constexpr (std::is_same_v<awaiter, co_for_emplace_trick>) {
-                static_assert(!std::is_reference_v<T>);
                 return await_co_for_emplace<T>{};
             } else if constexpr (std::is_same_v<awaiter, co_result_ref_trick>) {
-                static_assert(!std::is_reference_v<T>);
                 return await_co_result_ref<T>{};
             } else if constexpr (requires { std::forward<Awaiter>(a).operator co_await(); }) {
                 return std::forward<Awaiter>(a).operator co_await();
@@ -472,17 +570,26 @@ struct job {
                 return std::forward<Awaiter>(a);
             }
         }
+        static void* operator new(size_t size) {
+            return ::operator new(size);
+        }
+        static void operator delete(void* ptr, size_t size) {
+            ::operator delete(ptr, size);
+        }
     };
-
-    // co_await для нашей корутины
-    awaitable<job, T> operator co_await() && noexcept {
-        return { *this };
+    // простой co_await для нашей корутины
+    simple_awaitable<job, T> operator co_await() && noexcept {
+        return { std::move(*this) };
     }
 
     // Метод для запуска ожидания с возвращением во внешнее неинициализированное значение.
-    template<typename K> requires (!std::is_reference_v<T> && std::is_same_v<T, K>)
-    awaitable_transfer<job, K> to(const uninit<K>& ret) && {
-        return { *this, const_cast<uninit<K>&>(ret) };
+    awaitable_transfer<job, T> to(const job_store_type_t<T, true>& ret) && {
+        return { std::move(*this), reinterpret_cast<job_store_type_t<T>&>(const_cast<job_store_type_t<T, true>&>(ret)) };
+    }
+
+    // Метод для запуска ожидания с возвращением во внешнее неинициализированное значение.
+    awaitable_transfer<job, T> to(const job_store_type_t<T, false>& ret) && {
+        return { std::move(*this), const_cast<job_store_type_t<T, false>&>(ret) };
     }
 
     // Запуск корутины
@@ -491,9 +598,9 @@ struct job {
     }
 
     // Запуск корутины с сохранением результата во внешнем значении
-    template<typename K> requires (!std::is_reference_v<T> && std::is_same_v<T, K>)
-    executable_transfer<job, K> exec_to(const uninit<K>& ret) && {
-        return { *this, const_cast<uninit<K>&>(ret) };
+    template<typename K, bool AD> requires (!std::is_reference_v<T> && std::is_same_v<T, K>)
+    executable_transfer<job, K> exec_to(const uninit<K, AD>& ret) && {
+        return { *this, reinterpret_cast<uninit<K, false>&>(const_cast<uninit<K, AD>&>(ret)) };
     }
 
     std::coroutine_handle<promise_type> my_coro_;
