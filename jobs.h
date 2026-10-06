@@ -83,6 +83,11 @@ private:
     alignas(T) char value_[sizeof(T)];
 };
 
+template<bool AutoDtor>
+struct uninit<void, AutoDtor> {
+    void dtor() {}
+};
+
 // Выясним, в каком виде промежуточно хранить возвращаемое корутиной значение.
 template<typename T, bool AutoDestruct = false>
 using job_store_type_t = uninit<std::conditional_t<std::is_reference_v<T>, std::remove_cvref_t<T>*, T>, AutoDestruct>;
